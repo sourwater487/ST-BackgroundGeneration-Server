@@ -1,7 +1,145 @@
 const { randomUUID } = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const jobs = new Map();
 const GENERATE_PATH = '/api/backends/chat-completions/generate';
+
+const PUSH_STATE_PATH = path.join(
+    process.cwd(),
+    'data',
+    'default-user',
+    'background-generation-push.json',
+);
+
+const VAPID_SUBJECT = 'mailto:webpush@lin-che.com';
+
+let webPush = null;
+let pushState = null;
+
+function persistPushState() {
+    const directory = path.dirname(PUSH_STATE_PATH);
+    const temporaryPath = `${PUSH_STATE_PATH}.tmp`;
+
+    fs.mkdirSync(directory, {
+        recursive: true,
+    });
+
+    fs.writeFileSync(
+        temporaryPath,
+        JSON.stringify(pushState, null, 2),
+        {
+            encoding: 'utf8',
+            mode: 0o600,
+        },
+    );
+
+    fs.renameSync(temporaryPath, PUSH_STATE_PATH);
+    fs.chmodSync(PUSH_STATE_PATH, 0o600);
+}
+
+async function initPush() {
+    const module = await import('web-push');
+    webPush = module.default || module;
+
+    if (fs.existsSync(PUSH_STATE_PATH)) {
+        pushState = JSON.parse(
+            fs.readFileSync(PUSH_STATE_PATH, 'utf8'),
+        );
+    } else {
+        pushState = {
+            vapidKeys: webPush.generateVAPIDKeys(),
+            subscriptions: [],
+        };
+    }
+
+    if (
+        !pushState?.vapidKeys?.publicKey
+        || !pushState?.vapidKeys?.privateKey
+    ) {
+        pushState.vapidKeys = webPush.generateVAPIDKeys();
+    }
+
+    if (!Array.isArray(pushState.subscriptions)) {
+        pushState.subscriptions = [];
+    }
+
+    webPush.setVapidDetails(
+        VAPID_SUBJECT,
+        pushState.vapidKeys.publicKey,
+        pushState.vapidKeys.privateKey,
+    );
+
+    persistPushState();
+}
+
+async function sendCompletionPush() {
+    if (
+        !webPush
+        || !Array.isArray(pushState?.subscriptions)
+        || pushState.subscriptions.length === 0
+    ) {
+        return;
+    }
+
+    /*
+     * 推送负载不包含角色名、回复正文或聊天预览。
+     * 通知显示文字由前端 Service Worker 固定生成。
+     */
+    const payload = JSON.stringify({
+        type: 'generation-complete',
+        url: '/',
+    });
+
+    const expiredEndpoints = new Set();
+    const subscriptions = pushState.subscriptions.slice();
+
+    await Promise.all(
+        subscriptions.map(async subscription => {
+            try {
+                await webPush.sendNotification(
+                    subscription,
+                    payload,
+                    {
+                        TTL: 300,
+                        topic: 'st-generation-complete',
+                    },
+                );
+            } catch (error) {
+                const statusCode =
+                    error?.statusCode
+                    ?? error?.status;
+
+                if (
+                    statusCode === 404
+                    || statusCode === 410
+                ) {
+                    expiredEndpoints.add(
+                        subscription.endpoint,
+                    );
+                    return;
+                }
+
+                console.error(
+                    '[Background Generation] Push failed:',
+                    statusCode || error?.message || error,
+                );
+            }
+        }),
+    );
+
+    if (expiredEndpoints.size > 0) {
+        pushState.subscriptions =
+            pushState.subscriptions.filter(
+                subscription =>
+                    !expiredEndpoints.has(
+                        subscription.endpoint,
+                    ),
+            );
+
+        persistPushState();
+    }
+}
 
 function jobView(job, includeResult = false) {
     const data = {
@@ -42,14 +180,75 @@ function getUpstreamHeaders(req) {
 }
 
 async function init(router) {
+    await initPush();
+
     router.get('/health', (req, res) => {
         res.json({
             ok: true,
             plugin: 'background-generation',
-            version: '0.3.0',
+            version: '0.4.0',
             jobs: jobs.size,
             time: new Date().toISOString(),
         });
+    });
+
+    router.get('/push/public-key', (req, res) => {
+        res.json({
+            ok: true,
+            publicKey: pushState.vapidKeys.publicKey,
+        });
+    });
+
+    router.post('/push/subscribe', (req, res) => {
+        const subscription =
+            req.body?.subscription ?? req.body;
+
+        if (
+            !subscription
+            || typeof subscription.endpoint !== 'string'
+            || typeof subscription.keys?.p256dh !== 'string'
+            || typeof subscription.keys?.auth !== 'string'
+        ) {
+            return res.status(400).json({
+                ok: false,
+                error: 'Invalid push subscription',
+            });
+        }
+
+        const index = pushState.subscriptions.findIndex(
+            item => item.endpoint === subscription.endpoint,
+        );
+
+        if (index >= 0) {
+            pushState.subscriptions[index] = subscription;
+        } else {
+            pushState.subscriptions.push(subscription);
+        }
+
+        persistPushState();
+
+        res.json({ ok: true });
+    });
+
+    router.post('/push/unsubscribe', (req, res) => {
+        const endpoint = req.body?.endpoint;
+
+        if (typeof endpoint !== 'string') {
+            return res.status(400).json({
+                ok: false,
+                error: 'endpoint is required',
+            });
+        }
+
+        pushState.subscriptions =
+            pushState.subscriptions.filter(
+                subscription =>
+                    subscription.endpoint !== endpoint,
+            );
+
+        persistPushState();
+
+        res.json({ ok: true });
     });
 
     router.get('/jobs', (req, res) => {
@@ -181,6 +380,13 @@ async function init(router) {
 
             if (!upstream.ok) {
                 job.error = `Upstream returned HTTP ${upstream.status}`;
+            }
+
+            if (
+                job.status === 'completed'
+                && job.metadata?.notificationsEnabled === true
+            ) {
+                void sendCompletionPush();
             }
 
             if (clientConnected && !res.destroyed && !res.writableEnded) {
