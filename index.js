@@ -152,6 +152,7 @@ function jobView(job, includeResult = false) {
         error: job.error,
         clientDisconnected: job.clientDisconnected,
         deliveryRequired: job.deliveryRequired,
+        clientVisible: job.clientVisible,
     };
 
     if (includeResult) {
@@ -186,7 +187,7 @@ async function init(router) {
         res.json({
             ok: true,
             plugin: 'background-generation',
-            version: '0.4.0',
+            version: '0.4.1',
             jobs: jobs.size,
             time: new Date().toISOString(),
         });
@@ -275,6 +276,21 @@ async function init(router) {
         });
     });
 
+    router.post('/jobs/:id/visibility', (req, res) => {
+        const job = jobs.get(req.params.id);
+
+        if (!job) {
+            return res.status(404).json({
+                ok: false,
+                error: 'Job not found',
+            });
+        }
+
+        job.clientVisible = req.body?.visible === true;
+
+        res.json({ ok: true });
+    });
+
     router.delete('/jobs/:id', (req, res) => {
         const deleted = jobs.delete(req.params.id);
 
@@ -312,6 +328,8 @@ async function init(router) {
             error: null,
             clientDisconnected: false,
             deliveryRequired: false,
+            clientVisible:
+                metadata.clientVisible !== false,
         };
 
         jobs.set(id, job);
@@ -323,6 +341,7 @@ async function init(router) {
                 clientConnected = false;
                 job.clientDisconnected = true;
                 job.deliveryRequired = true;
+                job.clientVisible = false;
             }
         });
 
@@ -385,6 +404,10 @@ async function init(router) {
             if (
                 job.status === 'completed'
                 && job.metadata?.notificationsEnabled === true
+                && (
+                    job.clientVisible === false
+                    || job.clientDisconnected === true
+                )
             ) {
                 void sendCompletionPush();
             }
