@@ -12,6 +12,8 @@ function jobView(job, includeResult = false) {
         finishedAt: job.finishedAt,
         responseStatus: job.responseStatus,
         error: job.error,
+        clientDisconnected: job.clientDisconnected,
+        deliveryRequired: job.deliveryRequired,
     };
 
     if (includeResult) {
@@ -44,7 +46,7 @@ async function init(router) {
         res.json({
             ok: true,
             plugin: 'background-generation',
-            version: '0.2.0',
+            version: '0.3.0',
             jobs: jobs.size,
             time: new Date().toISOString(),
         });
@@ -74,6 +76,19 @@ async function init(router) {
         });
     });
 
+    router.delete('/jobs/:id', (req, res) => {
+        const deleted = jobs.delete(req.params.id);
+
+        if (!deleted) {
+            return res.status(404).json({
+                ok: false,
+                error: 'Job not found',
+            });
+        }
+
+        res.json({ ok: true });
+    });
+
     router.post('/generate', async (req, res) => {
         const requestBody = req.body?.requestBody;
         const metadata = req.body?.metadata || {};
@@ -96,6 +111,8 @@ async function init(router) {
             contentType: null,
             result: null,
             error: null,
+            clientDisconnected: false,
+            deliveryRequired: false,
         };
 
         jobs.set(id, job);
@@ -105,6 +122,8 @@ async function init(router) {
         res.on('close', () => {
             if (!res.writableEnded) {
                 clientConnected = false;
+                job.clientDisconnected = true;
+                job.deliveryRequired = true;
             }
         });
 
@@ -150,6 +169,8 @@ async function init(router) {
                         res.write(chunk);
                     } catch {
                         clientConnected = false;
+                        job.clientDisconnected = true;
+                        job.deliveryRequired = true;
                     }
                 }
             }
