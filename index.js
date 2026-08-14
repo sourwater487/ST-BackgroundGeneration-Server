@@ -73,7 +73,7 @@ async function initPush() {
     persistPushState();
 }
 
-async function sendCompletionPush() {
+async function sendCompletionPush(navigateUrl) {
     if (
         !webPush
         || !Array.isArray(pushState?.subscriptions)
@@ -82,13 +82,36 @@ async function sendCompletionPush() {
         return;
     }
 
+    let normalizedNavigateUrl;
+
+    try {
+        const url = new URL(navigateUrl);
+
+        if (!['https:', 'http:'].includes(url.protocol)) {
+            throw new Error('Invalid notification URL');
+        }
+
+        normalizedNavigateUrl = url.href;
+    } catch {
+        console.error(
+            '[Background Generation] Push skipped: invalid navigate URL',
+        );
+        return;
+    }
+
     /*
-     * 推送负载不包含角色名、回复正文或聊天预览。
-     * 通知显示文字由前端 Service Worker 固定生成。
+     * Declarative Web Push：
+     * 仅包含固定通知文字与 ST 地址，不包含角色名、
+     * 回复正文、聊天内容或消息预览。
      */
     const payload = JSON.stringify({
-        type: 'generation-complete',
-        url: '/',
+        web_push: 8030,
+        notification: {
+            title: '新消息已送达...ʢᴗ.ᴗʡᶻ',
+            navigate: normalizedNavigateUrl,
+            silent: false,
+            tag: 'st-generation-complete',
+        },
     });
 
     const expiredEndpoints = new Set();
@@ -187,7 +210,7 @@ async function init(router) {
         res.json({
             ok: true,
             plugin: 'background-generation',
-            version: '0.4.1',
+            version: '0.4.2',
             jobs: jobs.size,
             time: new Date().toISOString(),
         });
@@ -409,7 +432,9 @@ async function init(router) {
                     || job.clientDisconnected === true
                 )
             ) {
-                void sendCompletionPush();
+                void sendCompletionPush(
+                    job.metadata?.notificationUrl,
+                );
             }
 
             if (clientConnected && !res.destroyed && !res.writableEnded) {
