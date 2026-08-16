@@ -210,7 +210,7 @@ async function init(router) {
         res.json({
             ok: true,
             plugin: 'background-generation',
-            version: '0.4.2',
+            version: '0.4.3',
             jobs: jobs.size,
             time: new Date().toISOString(),
         });
@@ -309,7 +309,19 @@ async function init(router) {
             });
         }
 
-        job.clientVisible = req.body?.visible === true;
+        const visible =
+            req.body?.visible === true;
+
+        job.clientVisible = visible;
+
+        /*
+         * iOS 切到其他 App 时可能冻结页面，却继续维持连接。
+         * 一旦进入后台，该任务必须由服务端保留并等待回填；
+         * 后续重新 visible 也不能撤销这个标记。
+         */
+        if (!visible) {
+            job.deliveryRequired = true;
+        }
 
         res.json({ ok: true });
     });
