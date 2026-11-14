@@ -4,6 +4,7 @@ const path = require('node:path');
 
 const jobs = new Map();
 const GENERATE_PATH = '/api/backends/chat-completions/generate';
+const GENERATE_PATHS = new Set([GENERATE_PATH, '/api/plugins/vertex-paygo/native-gemini/generate']);
 
 const PUSH_STATE_PATH = path.join(
     process.cwd(),
@@ -210,7 +211,7 @@ async function init(router) {
         res.json({
             ok: true,
             plugin: 'background-generation',
-            version: '0.4.3',
+            version: '0.5.0',
             jobs: jobs.size,
             time: new Date().toISOString(),
         });
@@ -326,7 +327,19 @@ async function init(router) {
         res.json({ ok: true });
     });
 
+    router.post('/jobs/:id/cancel', (req, res) => {
+        const job = jobs.get(req.params.id);
+        if (!job) return res.status(404).json({ ok: false });
+        job.status = 'cancelled';
+        job.deliveryRequired = false;
+        job.controller.abort();
+        res.json({ ok: true });
+    });
+
     router.delete('/jobs/:id', (req, res) => {
+        if (jobs.get(req.params.id)?.status === 'running') {
+            return res.status(409).json({ ok: false, error: 'Job is still running' });
+        }
         const deleted = jobs.delete(req.params.id);
 
         if (!deleted) {
@@ -342,6 +355,10 @@ async function init(router) {
     router.post('/generate', async (req, res) => {
         const requestBody = req.body?.requestBody;
         const metadata = req.body?.metadata || {};
+        const targetPath = req.body?.targetPath ?? GENERATE_PATH;
+        if (!GENERATE_PATHS.has(targetPath)) {
+            return res.status(400).json({ ok: false, error: 'Unsupported generation route' });
+        }
 
         if (!requestBody || typeof requestBody !== 'object') {
             return res.status(400).json({
@@ -353,6 +370,7 @@ async function init(router) {
         const id = randomUUID();
         const job = {
             id,
+            controller: new AbortController(),
             status: 'running',
             metadata,
             createdAt: new Date().toISOString(),
@@ -362,7 +380,7 @@ async function init(router) {
             result: null,
             error: null,
             clientDisconnected: false,
-            deliveryRequired: false,
+            deliveryRequired: true,
             clientVisible:
                 metadata.clientVisible !== false,
         };
@@ -370,6 +388,7 @@ async function init(router) {
         jobs.set(id, job);
 
         let clientConnected = true;
+        const chunks = [];
 
         res.on('close', () => {
             if (!res.writableEnded) {
@@ -383,11 +402,12 @@ async function init(router) {
         try {
             const localPort = req.socket.localPort;
             const upstreamUrl =
-                `http://127.0.0.1:${localPort}${GENERATE_PATH}`;
+                `http://127.0.0.1:${localPort}${targetPath}`;
 
             const upstream = await fetch(upstreamUrl, {
                 method: 'POST',
                 headers: getUpstreamHeaders(req),
+                signal: job.controller.signal,
                 body: JSON.stringify(requestBody),
             });
 
@@ -404,7 +424,6 @@ async function init(router) {
                 res.flushHeaders();
             }
 
-            const chunks = [];
             const reader = upstream.body.getReader();
 
             while (true) {
@@ -429,7 +448,19 @@ async function init(router) {
             }
 
             job.result = Buffer.concat(chunks).toString('utf8');
-            job.status = upstream.ok ? 'completed' : 'failed';
+            // HTTP 200 / socket EOF alone do not prove an SSE generation finished.
+            const complete = !job.contentType.includes('text/event-stream')
+                || /(?:^|\n)data:\s*\[DONE\]/.test(job.result)
+                || job.result.split(/\r?\n/).some(line => {
+                    if (!line.startsWith('data:')) return false;
+                    try {
+                        const data = JSON.parse(line.slice(5));
+                        return data.choices?.some(choice => choice.finish_reason != null)
+                            || data.candidates?.some(candidate => typeof candidate.finishReason === 'string' && candidate.finishReason.length > 0);
+                    } catch { return false; }
+                });
+            job.status = upstream.ok && complete ? 'completed' : 'failed';
+            if (upstream.ok && !complete) job.error = 'Upstream stream ended before completion';
             job.finishedAt = new Date().toISOString();
 
             if (!upstream.ok) {
@@ -453,7 +484,8 @@ async function init(router) {
                 res.end();
             }
         } catch (error) {
-            job.status = 'failed';
+            job.result = Buffer.concat(chunks).toString('utf8');
+            job.status = job.controller.signal.aborted ? 'cancelled' : 'failed';
             job.error = error?.message || String(error);
             job.finishedAt = new Date().toISOString();
 
